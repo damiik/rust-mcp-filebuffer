@@ -1,9 +1,7 @@
+// ============================================================================
+// src/tools.rs
+// ============================================================================
 use rust_mcp_sdk::schema::{schema_utils::CallToolError, CallToolResult, TextContent};
-use rust_mcp_sdk::{
-    macros::{mcp_tool, JsonSchema},
-    tool_box,
-};
-
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -11,176 +9,430 @@ use tokio::fs;
 use sha2::{Sha256, Digest};
 use crate::state::ServerState;
 
-// Load binary file
+use rust_mcp_sdk::macros::{mcp_tool, JsonSchema};
+
+//****************//
+//  LoadBinary    //
+//****************//
 #[mcp_tool(
     name = "load_binary",
-    title = "Load Binary File",
-    description = "Loads a binary file into the buffer for analysis",
-    read_only_hint = false
+    description = "Loads a binary file into the buffer for analysis"
 )]
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
 pub struct LoadBinary {
     /// Path to the binary file
     pub path: String,
-    #[serde(skip)]
-    pub state: Arc<RwLock<ServerState>>,
 }
 
-// Read bytes at offset
+impl LoadBinary {
+    pub async fn call_tool(&self, state: &Arc<RwLock<ServerState>>) 
+        -> Result<CallToolResult, CallToolError> 
+    {
+        let data = fs::read(&self.path).await
+            .map_err(|e| CallToolError::from_message(format!("Failed to read file: {}", e)))?;
+        
+        let mut s = state.write().await;
+        s.buffer = data.clone();
+        s.file_loaded = Some(self.path.clone());
+        s.bookmarks.clear();
+        s.segments.clear();
+        s.display();
+        
+        Ok(CallToolResult::text_content(vec![
+            TextContent::from(format!("✅ Loaded {} bytes from '{}'", data.len(), self.path))
+        ]))
+    }
+}
+
+//****************//
+//  ReadBytes     //
+//****************//
 #[mcp_tool(
     name = "read_bytes",
-    title = "Read Bytes",
-    description = "Reads a specified number of bytes from the buffer at a given offset, returns hex dump",
-    read_only_hint = true
+    description = "Reads a specified number of bytes from the buffer at a given offset, returns hex dump"
 )]
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
 pub struct ReadBytes {
     /// Starting offset in the buffer
-    pub offset: u64,
+    pub offset: usize,
     /// Number of bytes to read
-    pub length: u64,
-    pub state: Arc<RwLock<ServerState>>,
+    pub length: usize,
 }
 
-// Search for byte pattern
+impl ReadBytes {
+    pub async fn call_tool(&self, state: &Arc<RwLock<ServerState>>) 
+        -> Result<CallToolResult, CallToolError> 
+    {
+        let s = state.read().await;
+        
+        if self.offset + self.length > s.buffer.len() {
+            return Err(CallToolError::from_message("Read exceeds buffer bounds"));
+        }
+        
+        let bytes = &s.buffer[self.offset..self.offset + self.length];
+        let hex_dump = hex::encode(bytes);
+        
+        let ascii: String = bytes.iter()
+            .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
+            .collect();
+        
+        let output = format!(
+            "Offset 0x{:08X} ({} bytes):\nHex: {}\nASCII: {}",
+            self.offset, self.length, hex_dump, ascii
+        );
+        
+        Ok(CallToolResult::text_content(vec![TextContent::from(output)]))
+    }
+}
+
+//*******************//
+//  SearchPattern    //
+//*******************//
 #[mcp_tool(
     name = "search_pattern",
-    title = "Search Byte Pattern",
-    description = "Searches for a hex pattern in the buffer, returns all matching offsets",
-    read_only_hint = true
+    description = "Searches for a hex pattern in the buffer, returns all matching offsets"
 )]
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
 pub struct SearchPattern {
     /// Hex string pattern to search for (e.g., '4D5A' for PE header)
     pub pattern: String,
-    pub state: Arc<RwLock<ServerState>>,
 }
 
-// Extract segment
+impl SearchPattern {
+    pub async fn call_tool(&self, state: &Arc<RwLock<ServerState>>) 
+        -> Result<CallToolResult, CallToolError> 
+    {
+        let s = state.read().await;
+        
+        let pattern = hex::decode(&self.pattern)
+            .map_err(|e| CallToolError::from_message(format!("Invalid hex pattern: {}", e)))?;
+        
+        let mut matches = Vec::new();
+        for i in 0..=s.buffer.len().saturating_sub(pattern.len()) {
+            if &s.buffer[i..i + pattern.len()] == pattern.as_slice() {
+                matches.push(i);
+            }
+        }
+        
+        let output = if matches.is_empty() {
+            "No matches found".to_string()
+        } else {
+            format!("Found {} matches at offsets:\n{}", 
+                matches.len(),
+                matches.iter()
+                    .map(|&off| format!("  0x{:08X}", off))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        };
+        
+        Ok(CallToolResult::text_content(vec![TextContent::from(output)]))
+    }
+}
+
+//*******************//
+//  ExtractSegment   //
+//*******************//
 #[mcp_tool(
     name = "extract_segment",
-    title = "Extract Segment",
-    description = "Extracts a segment of bytes and stores it for later reference",
-    read_only_hint = false
+    description = "Extracts a segment of bytes and stores it for later reference"
 )]
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
 pub struct ExtractSegment {
     /// Starting offset
-    pub offset: u64,
+    pub offset: usize,
     /// Length of segment
-    pub length: u64,
+    pub length: usize,
     /// Optional label for the segment
     pub label: Option<String>,
-    pub state: Arc<RwLock<ServerState>>,
 }
 
-// Add bookmark
+impl ExtractSegment {
+    pub async fn call_tool(&self, state: &Arc<RwLock<ServerState>>) 
+        -> Result<CallToolResult, CallToolError> 
+    {
+        let mut s = state.write().await;
+        
+        if self.offset + self.length > s.buffer.len() {
+            return Err(CallToolError::from_message("Segment exceeds buffer bounds"));
+        }
+        
+        let data = s.buffer[self.offset..self.offset + self.length].to_vec();
+        let segment = crate::state::BinarySegment {
+            offset: self.offset,
+            data: data.clone(),
+            label: self.label.clone(),
+        };
+        
+        s.segments.push(segment);
+        s.display();
+        
+        Ok(CallToolResult::text_content(vec![
+            TextContent::from(format!(
+                "✅ Extracted segment: {} bytes at 0x{:08X}{}",
+                self.length,
+                self.offset,
+                self.label.as_ref().map(|l| format!(" ({})", l)).unwrap_or_default()
+            ))
+        ]))
+    }
+}
+
+//****************//
+//  AddBookmark   //
+//****************//
 #[mcp_tool(
     name = "add_bookmark",
-    title = "Add Bookmark",
-    description = "Creates a named bookmark at a specific offset for quick reference",
-    read_only_hint = false
+    description = "Creates a named bookmark at a specific offset for quick reference"
 )]
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
 pub struct AddBookmark {
     /// Name for the bookmark
     pub name: String,
     /// Offset to bookmark
-    pub offset: u64,
-    pub state: Arc<RwLock<ServerState>>,
+    pub offset: usize,
 }
 
-// Interpret as string
+impl AddBookmark {
+    pub async fn call_tool(&self, state: &Arc<RwLock<ServerState>>) 
+        -> Result<CallToolResult, CallToolError> 
+    {
+        let mut s = state.write().await;
+        
+        if self.offset > s.buffer.len() {
+            return Err(CallToolError::from_message("Offset exceeds buffer size"));
+        }
+        
+        s.bookmarks.insert(self.name.clone(), self.offset);
+        s.display();
+        
+        Ok(CallToolResult::text_content(vec![
+            TextContent::from(format!("✅ Bookmark '{}' added at 0x{:08X}", self.name, self.offset))
+        ]))
+    }
+}
+
+//****************//
+//  ReadString    //
+//****************//
 #[mcp_tool(
     name = "read_string",
-    title = "Read String",
-    description = "Attempts to read bytes as ASCII/UTF-8 string from specified offset",
-    read_only_hint = true
+    description = "Attempts to read bytes as ASCII/UTF-8 string from specified offset"
 )]
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
 pub struct ReadString {
     /// Starting offset
-    pub offset: u64,
+    pub offset: usize,
     /// Maximum length to read
-    pub max_length: u64,
-    pub state: Arc<RwLock<ServerState>>,
+    pub max_length: usize,
 }
 
-// Read integers
+impl ReadString {
+    pub async fn call_tool(&self, state: &Arc<RwLock<ServerState>>) 
+        -> Result<CallToolResult, CallToolError> 
+    {
+        let s = state.read().await;
+        
+        let end = (self.offset + self.max_length).min(s.buffer.len());
+        let bytes = &s.buffer[self.offset..end];
+        
+        let null_pos = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        let str_bytes = &bytes[..null_pos];
+        
+        let text = String::from_utf8_lossy(str_bytes);
+        
+        Ok(CallToolResult::text_content(vec![
+            TextContent::from(format!("String at 0x{:08X} ({} bytes):\n{}", 
+                self.offset, str_bytes.len(), text))
+        ]))
+    }
+}
+
+//****************//
+//  ReadInteger   //
+//****************//
 #[mcp_tool(
     name = "read_integer",
-    title = "Read Integer",
-    description = "Reads bytes as integer (u8, u16, u32, u64) with specified endianness",
-    read_only_hint = true
+    description = "Reads bytes as integer (u8, u16, u32, u64) with specified endianness"
 )]
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
 pub struct ReadInteger {
     /// Starting offset
-    pub offset: u64,
+    pub offset: usize,
     /// Integer size: 1, 2, 4, or 8 bytes
     pub size: u8,
     /// Endianness: 'little' or 'big'
     pub endian: String,
-    pub state: Arc<RwLock<ServerState>>,
 }
 
-// Calculate hash
+impl ReadInteger {
+    pub async fn call_tool(&self, state: &Arc<RwLock<ServerState>>) 
+        -> Result<CallToolResult, CallToolError> 
+    {
+        let s = state.read().await;
+        
+        if self.offset + self.size as usize > s.buffer.len() {
+            return Err(CallToolError::from_message("Read exceeds buffer bounds"));
+        }
+        
+        let bytes = &s.buffer[self.offset..self.offset + self.size as usize];
+        
+        let value = match (self.size, self.endian.as_str()) {
+            (1, _) => bytes[0] as u64,
+            (2, "little") => u16::from_le_bytes([bytes[0], bytes[1]]) as u64,
+            (2, "big") => u16::from_be_bytes([bytes[0], bytes[1]]) as u64,
+            (4, "little") => u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64,
+            (4, "big") => u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64,
+            (8, "little") => u64::from_le_bytes(bytes.try_into().unwrap()),
+            (8, "big") => u64::from_be_bytes(bytes.try_into().unwrap()),
+            _ => return Err(CallToolError::from_message("Invalid size or endianness")),
+        };
+        
+        Ok(CallToolResult::text_content(vec![
+            TextContent::from(format!(
+                "u{} at 0x{:08X} ({} endian): {} (0x{:X})",
+                self.size * 8, self.offset, self.endian, value, value
+            ))
+        ]))
+    }
+}
+
+//******************//
+//  CalculateHash   //
+//******************//
 #[mcp_tool(
     name = "calculate_hash",
-    title = "Calculate Hash",
-    description = "Calculates SHA-256 hash of the entire buffer or a segment",
-    read_only_hint = true
+    description = "Calculates SHA-256 hash of the entire buffer or a segment"
 )]
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
 pub struct CalculateHash {
     /// Optional offset (if None, hash entire buffer)
-    pub offset: Option<u64>,
+    pub offset: Option<usize>,
     /// Optional length (if None, hash from offset to end)
-    pub length: Option<u64>,
-    pub state: Arc<RwLock<ServerState>>,
+    pub length: Option<usize>,
 }
 
-// Get buffer info
+impl CalculateHash {
+    pub async fn call_tool(&self, state: &Arc<RwLock<ServerState>>) 
+        -> Result<CallToolResult, CallToolError> 
+    {
+        let s = state.read().await;
+        
+        let offset = self.offset.unwrap_or(0);
+        let end = self.length
+            .map(|len| offset + len)
+            .unwrap_or(s.buffer.len());
+        
+        if end > s.buffer.len() {
+            return Err(CallToolError::from_message("Range exceeds buffer size"));
+        }
+        
+        let data = &s.buffer[offset..end];
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        let hash = hasher.finalize();
+        
+        Ok(CallToolResult::text_content(vec![
+            TextContent::from(format!(
+                "SHA-256 (0x{:08X} - 0x{:08X}, {} bytes):\n{}",
+                offset, end, data.len(), hex::encode(hash)
+            ))
+        ]))
+    }
+}
+
+//************//
+//  GetInfo   //
+//************//
 #[mcp_tool(
     name = "get_info",
-    title = "Get Buffer Info",
-    description = "Returns detailed information about the current buffer state",
-    read_only_hint = true
+    description = "Returns detailed information about the current buffer state"
 )]
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
-pub struct GetInfo {
-    pub state: Arc<RwLock<ServerState>>,
+pub struct GetInfo {}
+
+impl GetInfo {
+    pub async fn call_tool(&self, state: &Arc<RwLock<ServerState>>) 
+        -> Result<CallToolResult, CallToolError> 
+    {
+        let s = state.read().await;
+        
+        let info = format!(
+            "📊 Buffer Information:\n\
+             File: {}\n\
+             Size: {} bytes (0x{:X})\n\
+             Bookmarks: {}\n\
+             Segments: {}\n\
+             Notes: {}",
+            s.file_loaded.as_deref().unwrap_or("None"),
+            s.buffer.len(),
+            s.buffer.len(),
+            s.bookmarks.len(),
+            s.segments.len(),
+            s.analysis_notes.len()
+        );
+        
+        Ok(CallToolResult::text_content(vec![TextContent::from(info)]))
+    }
 }
 
-// Add analysis note
+//************//
+//  AddNote   //
+//************//
 #[mcp_tool(
     name = "add_note",
-    title = "Add Analysis Note",
-    description = "Adds a textual analysis note to the current session",
-    read_only_hint = false
+    description = "Adds a textual analysis note to the current session"
 )]
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
 pub struct AddNote {
     /// The analysis note text
     pub note: String,
-    pub state: Arc<RwLock<ServerState>>,
 }
 
-// Set output
+impl AddNote {
+    pub async fn call_tool(&self, state: &Arc<RwLock<ServerState>>) 
+        -> Result<CallToolResult, CallToolError> 
+    {
+        let mut s = state.write().await;
+        s.analysis_notes.push(self.note.clone());
+        s.display();
+        
+        Ok(CallToolResult::text_content(vec![
+            TextContent::from("✅ Note added")
+        ]))
+    }
+}
+
+//**************//
+//  SetOutput   //
+//**************//
 #[mcp_tool(
     name = "set_output",
-    title = "Set Output",
-    description = "Sets the final analysis output text",
-    read_only_hint = false
+    description = "Sets the final analysis output text"
 )]
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
 pub struct SetOutput {
     /// Output text
     pub text: String,
-    pub state: Arc<RwLock<ServerState>>,
 }
 
-// Generate tool box
+impl SetOutput {
+    pub async fn call_tool(&self, state: &Arc<RwLock<ServerState>>) 
+        -> Result<CallToolResult, CallToolError> 
+    {
+        let mut s = state.write().await;
+        s.output = self.text.clone();
+        s.display();
+        
+        Ok(CallToolResult::text_content(vec![
+            TextContent::from("✅ Output set")
+        ]))
+    }
+}
+
+//*****************//
+//  BinaryTools    //
+//*****************//
 tool_box!(
     BinaryTools,
     [
@@ -197,117 +449,3 @@ tool_box!(
         SetOutput
     ]
 );
-
-// ============================================================================
-// Tool Implementations
-// ============================================================================
-
-impl LoadBinary {
-    pub async fn call_tool(&self) -> Result<CallToolResult, CallToolError> {
-        let mut s = self.state.write().await;
-        s.load_binary(&self.path).await;
-        Ok(CallToolResult::text_content(vec![TextContent::from(
-            format!("Loaded binary from {}", &self.path),
-        )]))
-    }
-}
-
-impl ReadBytes {
-    pub async fn call_tool(&self) -> Result<CallToolResult, CallToolError> {
-        let s = self.state.read().await;
-        let bytes = s.read_bytes(self.offset, self.length).await;
-        Ok(CallToolResult::text_content(vec![TextContent::from(
-            format!("Read bytes: {:?}", bytes),
-        )]))
-    }
-}
-
-impl SearchPattern {
-    pub async fn call_tool(&self) -> Result<CallToolResult, CallToolError> {
-        let s = self.state.read().await;
-        let results = s.search_pattern(&self.pattern).await;
-        Ok(CallToolResult::text_content(vec![TextContent::from(
-            format!("Found pattern at addresses: {:?}", results),
-        )]))
-    }
-}
-
-impl ExtractSegment {
-    pub async fn call_tool(&self) -> Result<CallToolResult, CallToolError> {
-        let s = self.state.read().await;
-        let segment = s.extract_segment(&self.label).await;
-        Ok(CallToolResult::text_content(vec![TextContent::from(
-            format!("Extracted segment: {:?}", segment),
-        )]))
-    }
-}
-
-impl AddBookmark {
-    pub async fn call_tool(&self) -> Result<CallToolResult, CallToolError> {
-        let mut s = self.state.write().await;
-        s.add_bookmark(self.offset, &self.name).await;
-        Ok(CallToolResult::text_content(vec![TextContent::from(
-            format!("Added bookmark '{}' at address {}", &self.name, self.offset),
-        )]))
-    }
-}
-
-impl ReadString {
-    pub async fn call_tool(&self) -> Result<CallToolResult, CallToolError> {
-        let s = self.state.read().await;
-        let string = s.read_string(self.offset).await;
-        Ok(CallToolResult::text_content(vec![TextContent::from(
-            format!("Read string: {}", string),
-        )]))
-    }
-}
-
-impl ReadInteger {
-    pub async fn call_tool(&self) -> Result<CallToolResult, CallToolError> {
-        let s = self.state.read().await;
-        let integer = s.read_integer(self.offset, self.size).await;
-        Ok(CallToolResult::text_content(vec![TextContent::from(
-            format!("Read integer: {}", integer),
-        )]))
-    }
-}
-
-impl CalculateHash {
-    pub async fn call_tool(&self) -> Result<CallToolResult, CallToolError> {
-        let s = self.state.read().await;
-        let hash = s.calculate_hash(self.offset, self.length).await;
-        Ok(CallToolResult::text_content(vec![TextContent::from(
-            format!("Calculated hash: {}", hash),
-        )]))
-    }
-}
-
-impl GetInfo {
-    pub async fn call_tool(&self) -> Result<CallToolResult, CallToolError> {
-        let s = self.state.read().await;
-        let info = s.get_info().await;
-        Ok(CallToolResult::text_content(vec![TextContent::from(
-            format!("File info: {:?}", info),
-        )]))
-    }
-}
-
-impl AddNote {
-    pub async fn call_tool(&self) -> Result<CallToolResult, CallToolError> {
-        let mut s = self.state.write().await;
-        s.add_note(&self.note).await;
-        Ok(CallToolResult::text_content(vec![TextContent::from(
-            format!("Added note: {}", self.note),
-        )]))
-    }
-}
-
-impl SetOutput {
-    pub async fn call_tool(&self) -> Result<CallToolResult, CallToolError> {
-        let mut s = self.state.write().await;
-        s.set_output(&self.text).await;
-        Ok(CallToolResult::text_content(vec![TextContent::from(
-            format!("Set output to {}", &self.text),
-        )]))
-    }
-}
