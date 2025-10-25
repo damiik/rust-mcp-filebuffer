@@ -1,0 +1,539 @@
+--- file: src/handler.rs ---
+```rust
+use crate::tools::BinaryTools;
+use async_trait::async_trait;
+use rust_mcp_sdk::schema::{
+    schema_utils::CallToolError,
+    CallToolRequest,
+    CallToolResult,
+    ListToolsRequest,
+    ListToolsResult,
+    RpcError,
+};
+use rust_mcp_sdk::{mcp_server::ServerHandler, McpServer};
+use std::sync::Arc;
+use crate::state::ServerState;
+use tokio::sync::RwLock;
+
+pub struct BinaryAnalysisHandler {
+    pub state: Arc<RwLock<ServerState>>,
+}
+
+impl BinaryAnalysisHandler {
+    pub async fn new() -> Self {
+        let state = Arc::new(RwLock::new(ServerState::new()));
+
+        println!("\n🔬 Binary Analysis MCP Server Starting...");
+        {
+            let s = state.read().await;
+            s.display();
+        }
+
+        Self { state }
+    }
+}
+
+#[async_trait]
+#[allow(unused)]
+impl ServerHandler for BinaryAnalysisHandler {
+    async fn handle_list_tools_request(
+        &self,
+        request: ListToolsRequest,
+        runtime: Arc<dyn McpServer>,
+    ) -> std::result::Result<ListToolsResult, RpcError> {
+        Ok(ListToolsResult {
+            meta: None,
+            next_cursor: None,
+            tools: BinaryTools::tools(),
+        })
+    }
+
+    async fn handle_call_tool_request(
+        &self,
+        request: CallToolRequest,
+        runtime: Arc<dyn McpServer>,
+    ) -> std::result::Result<CallToolResult, CallToolError> {
+        let tool_params: BinaryTools = 
+            BinaryTools::try_from(request.params).map_err(CallToolError::new)?;
+
+        match tool_params {
+            BinaryTools::LoadBinary(p) => p.call_tool().await,
+            BinaryTools::ReadBytes(p) => p.call_tool().await,
+            BinaryTools::SearchPattern(p) => p.call_tool().await,
+            BinaryTools::ExtractSegment(p) => p.call_tool().await,
+            BinaryTools::AddBookmark(p) => p.call_tool().await,
+            BinaryTools::ReadString(p) => p.call_tool().await,
+            BinaryTools::ReadInteger(p) => p.call_tool().await,
+            BinaryTools::CalculateHash(p) => p.call_tool().await,
+            BinaryTools::GetInfo(p) => p.call_tool().await,
+            BinaryTools::AddNote(p) => p.call_tool().await,
+            BinaryTools::SetOutput(p) => p.call_tool().await,
+        }
+    }
+}
+```
+
+--- file: src/main.rs ---
+```rust
+mod handler;
+mod tools;
+mod state;
+
+use clap::Parser;
+use handler::BinaryAnalysisHandler;
+use rust_mcp_sdk::event_store::InMemoryEventStore;
+use rust_mcp_sdk::mcp_server::{hyper_server, HyperServerOptions};
+use rust_mcp_sdk::schema::{
+    Implementation, InitializeResult, ServerCapabilities, ServerCapabilitiesTools,
+    LATEST_PROTOCOL_VERSION,
+};
+use rust_mcp_sdk::{error::SdkResult, mcp_server::ServerHandler};
+use std::sync::Arc;
+use std::time::Duration;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+#[derive(Parser)]
+#[command(name = "binary-analysis-mcp")]
+#[command(about = "MCP server for binary file analysis and reverse engineering")]
+struct Args {
+    #[arg(short, long, default_value = "8080")]
+    port: u16,
+}
+
+#[tokio::main]
+async fn main() -> SdkResult<()> {
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
+    let args = Args::parse();
+
+    let server_details = InitializeResult {
+        server_info: Implementation {
+            name: "binary-analysis-server".to_string(),
+            version: "0.1.0".to_string(),
+            title: Some("Binary Analysis MCP Server".to_string()),
+        },
+        capabilities: ServerCapabilities {
+            tools: Some(ServerCapabilitiesTools { list_changed: None }),
+            ..Default::default()
+        },
+        meta: None,
+        instructions: Some("server instructions...".to_string()),
+        protocol_version: LATEST_PROTOCOL_VERSION.to_string(),
+    };
+
+    let handler = BinaryAnalysisHandler::new().await;
+
+    let server = hyper_server::create_server(
+        server_details,
+        handler,
+        HyperServerOptions {
+            host: "127.0.0.1".to_string(),
+            port: args.port,
+            ping_interval: Duration::from_secs(5),
+            event_store: Some(Arc::new(InMemoryEventStore::default())), 
+            ..Default::default()
+        },
+    );
+
+    server.start().await?;
+
+    Ok(())
+}
+```
+
+--- file: src/state.rs ---
+```rust
+use std::collections::HashMap;
+
+#[derive(Clone, Debug)]
+pub struct BinarySegment {
+    pub offset: usize,
+    pub data: Vec<u8>,
+    pub label: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ServerState {
+    pub buffer: Vec<u8>,
+    pub file_loaded: Option<String>,
+    pub bookmarks: HashMap<String, usize>,
+    pub segments: Vec<BinarySegment>,
+    pub analysis_notes: Vec<String>,
+    pub output: String,
+}
+
+impl ServerState {
+    pub fn new() -> Self {
+        Self {
+            buffer: Vec::new(),
+            file_loaded: None,
+            bookmarks: HashMap::new(),
+            segments: Vec::new(),
+            analysis_notes: Vec::new(),
+            output: String::new(),
+        }
+    }
+
+    pub fn display(&self) {
+        println!("\n{}", "=".repeat(70));
+        println!("🔬 BINARY ANALYSIS SERVER STATE");
+        println!("{}", "=".repeat(70));
+        
+        println!("\n📂 Loaded File: {}", 
+            self.file_loaded.as_deref().unwrap_or("None"));
+        
+        println!("\n📊 Buffer: {} bytes", self.buffer.len());
+        if !self.buffer.is_empty() {
+            let preview_len = self.buffer.len().min(64);
+            println!("  First {} bytes (hex):", preview_len);
+            println!("  {}", hex::encode(&self.buffer[..preview_len]));
+            if self.buffer.len() > 64 {
+                println!("  ... ({} more bytes)", self.buffer.len() - 64);
+            }
+        }
+        
+        println!("\n🔖 Bookmarks: {}", self.bookmarks.len());
+        for (name, offset) in &self.bookmarks {
+            println!("  {} -> 0x{:08X}", name, offset);
+        }
+        
+        println!("\n📦 Segments: {}", self.segments.len());
+        for (i, seg) in self.segments.iter().enumerate() {
+            println!("  [{}] 0x{:08X}: {} bytes{}", 
+                i, 
+                seg.offset, 
+                seg.data.len(),
+                seg.label.as_ref().map(|l| format!(" ({})", l)).unwrap_or_default()
+            );
+        }
+        
+        println!("\n📝 Analysis Notes: {}", self.analysis_notes.len());
+        for (i, note) in self.analysis_notes.iter().enumerate() {
+            let preview = if note.len() > 60 {
+                format!("{}...", &note[..60])
+            } else {
+                note.clone()
+            };
+            println!("  [{}] {}", i, preview);
+        }
+        
+        println!("\n📤 Output:");
+        if self.output.is_empty() {
+            println!("  [Empty]");
+        } else {
+            println!("  {}", self.output);
+        }
+        
+        println!("\n{}", "=".repeat(70));
+    }
+}
+```
+
+--- file: src/tools.rs ---
+```rust
+use rust_mcp_sdk::{
+    macros::{mcp_tool, JsonSchema},
+    tool_box,
+};
+
+
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use tokio::fs;
+use sha2::{Sha256, Digest};
+use crate::state::ServerState;
+
+// Load binary file
+#[mcp_tool(
+    name = "load_binary",
+    title = "Load Binary File",
+    description = "Loads a binary file into the buffer for analysis",
+    read_only_hint = false
+)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct LoadBinary {
+    /// Path to the binary file
+    pub path: String,
+}
+
+// Read bytes at offset
+#[mcp_tool(
+    name = "read_bytes",
+    title = "Read Bytes",
+    description = "Reads a specified number of bytes from the buffer at a given offset, returns hex dump",
+    read_only_hint = true
+)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct ReadBytes {
+    /// Starting offset in the buffer
+    pub offset: u64,
+    /// Number of bytes to read
+    pub length: u64,
+}
+
+// Search for byte pattern
+#[mcp_tool(
+    name = "search_pattern",
+    title = "Search Byte Pattern",
+    description = "Searches for a hex pattern in the buffer, returns all matching offsets",
+    read_only_hint = true
+)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct SearchPattern {
+    /// Hex string pattern to search for (e.g., '4D5A' for PE header)
+    pub pattern: String,
+}
+
+// Extract segment
+#[mcp_tool(
+    name = "extract_segment",
+    title = "Extract Segment",
+    description = "Extracts a segment of bytes and stores it for later reference",
+    read_only_hint = false
+)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct ExtractSegment {
+    /// Starting offset
+    pub offset: u64,
+    /// Length of segment
+    pub length: u64,
+    /// Optional label for the segment
+    pub label: Option<String>,
+}
+
+// Add bookmark
+#[mcp_tool(
+    name = "add_bookmark",
+    title = "Add Bookmark",
+    description = "Creates a named bookmark at a specific offset for quick reference",
+    read_only_hint = false
+)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct AddBookmark {
+    /// Name for the bookmark
+    pub name: String,
+    /// Offset to bookmark
+    pub offset: u64,
+}
+
+// Interpret as string
+#[mcp_tool(
+    name = "read_string",
+    title = "Read String",
+    description = "Attempts to read bytes as ASCII/UTF-8 string from specified offset",
+    read_only_hint = true
+)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct ReadString {
+    /// Starting offset
+    pub offset: u64,
+    /// Maximum length to read
+    pub max_length: u64,
+}
+
+// Read integers
+#[mcp_tool(
+    name = "read_integer",
+    title = "Read Integer",
+    description = "Reads bytes as integer (u8, u16, u32, u64) with specified endianness",
+    read_only_hint = true
+)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct ReadInteger {
+    /// Starting offset
+    pub offset: u64,
+    /// Integer size: 1, 2, 4, or 8 bytes
+    pub size: u8,
+    /// Endianness: 'little' or 'big'
+    pub endian: String,
+}
+
+// Calculate hash
+#[mcp_tool(
+    name = "calculate_hash",
+    title = "Calculate Hash",
+    description = "Calculates SHA-256 hash of the entire buffer or a segment",
+    read_only_hint = true
+)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct CalculateHash {
+    /// Optional offset (if None, hash entire buffer)
+    pub offset: Option<u64>,
+    /// Optional length (if None, hash from offset to end)
+    pub length: Option<u64>,
+}
+
+// Get buffer info
+#[mcp_tool(
+    name = "get_info",
+    title = "Get Buffer Info",
+    description = "Returns detailed information about the current buffer state",
+    read_only_hint = true
+)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct GetInfo {}
+
+// Add analysis note
+#[mcp_tool(
+    name = "add_note",
+    title = "Add Analysis Note",
+    description = "Adds a textual analysis note to the current session",
+    read_only_hint = false
+)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct AddNote {
+    /// The analysis note text
+    pub note: String,
+}
+
+// Set output
+#[mcp_tool(
+    name = "set_output",
+    title = "Set Output",
+    description = "Sets the final analysis output text",
+    read_only_hint = false
+)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct SetOutput {
+    /// Output text
+    pub text: String,
+}
+
+// Generate tool box
+tool_box!(
+    BinaryTools,
+    [
+        LoadBinary,
+        ReadBytes,
+        SearchPattern,
+        ExtractSegment,
+        AddBookmark,
+        ReadString,
+        ReadInteger,
+        CalculateHash,
+        GetInfo,
+        AddNote,
+        SetOutput
+    ]
+);
+
+// ============================================================================
+// Tool Implementations
+// ============================================================================
+
+impl LoadBinary {
+    pub async fn call_tool(&self) -> Result<CallToolResult, CallToolError> {
+        let mut s = self.state.write().await;
+        s.load_binary(&self.path).await;
+        Ok(CallToolResult::text_content(vec![TextContent::from(
+            format!("Loaded binary from {}", &self.path),
+        )]))
+    }
+}
+
+impl ReadBytes {
+    pub async fn call_tool(&self) -> Result<CallToolResult, CallToolError> {
+        let s = self.state.read().await;
+        let bytes = s.read_bytes(self.address, self.length).await;
+        Ok(CallToolResult::text_content(vec![TextContent::from(
+            format!("Read bytes: {:?}", bytes),
+        )]))
+    }
+}
+
+impl SearchPattern {
+    pub async fn call_tool(&self) -> Result<CallToolResult, CallToolError> {
+        let s = self.state.read().await;
+        let results = s.search_pattern(&self.pattern).await;
+        Ok(CallToolResult::text_content(vec![TextContent::from(
+            format!("Found pattern at addresses: {:?}", results),
+        )]))
+    }
+}
+
+impl ExtractSegment {
+    pub async fn call_tool(&self) -> Result<CallToolResult, CallToolError> {
+        let s = self.state.read().await;
+        let segment = s.extract_segment(&self.segment_name).await;
+        Ok(CallToolResult::text_content(vec![TextContent::from(
+            format!("Extracted segment: {:?}", segment),
+        )]))
+    }
+}
+
+impl AddBookmark {
+    pub async fn call_tool(&self) -> Result<CallToolResult, CallToolError> {
+        let mut s = self.state.write().await;
+        s.add_bookmark(self.address, &self.name).await;
+        Ok(CallToolResult::text_content(vec![TextContent::from(
+            format!("Added bookmark '{}' at address {}", &self.name, self.address),
+        )]))
+    }
+}
+
+impl ReadString {
+    pub async fn call_tool(&self) -> Result<CallToolResult, CallToolError> {
+        let s = self.state.read().await;
+        let string = s.read_string(self.address).await;
+        Ok(CallToolResult::text_content(vec![TextContent::from(
+            format!("Read string: {}", string),
+        )]))
+    }
+}
+
+impl ReadInteger {
+    pub async fn call_tool(&self) -> Result<CallToolResult, CallToolError> {
+        let s = self.state.read().await;
+        let integer = s.read_integer(self.address, self.size).await;
+        Ok(CallToolResult::text_content(vec![TextContent::from(
+            format!("Read integer: {}", integer),
+        )]))
+    }
+}
+
+impl CalculateHash {
+    pub async fn call_tool(&self) -> Result<CallToolResult, CallToolError> {
+        let s = self.state.read().await;
+        let hash = s.calculate_hash(&self.algorithm).await;
+        Ok(CallToolResult::text_content(vec![TextContent::from(
+            format!("Calculated hash: {}", hash),
+        )]))
+    }
+}
+
+impl GetInfo {
+    pub async fn call_tool(&self) -> Result<CallToolResult, CallToolError> {
+        let s = self.state.read().await;
+        let info = s.get_info().await;
+        Ok(CallToolResult::text_content(vec![TextContent::from(
+            format!("File info: {:?}", info),
+        )]))
+    }
+}
+
+impl AddNote {
+    pub async fn call_tool(&self) -> Result<CallToolResult, CallToolError> {
+        let mut s = self.state.write().await;
+        s.add_note(self.address, &self.text).await;
+        Ok(CallToolResult::text_content(vec![TextContent::from(
+            format!("Added note at address {}", self.address),
+        )]))
+    }
+}
+
+impl SetOutput {
+    pub async fn call_tool(&self) -> Result<CallToolResult, CallToolError> {
+        let mut s = self.state.write().await;
+        s.set_output(&self.path).await;
+        Ok(CallToolResult::text_content(vec![TextContent::from(
+            format!("Set output to {}", &self.path),
+        )]))
+    }
+}
+```
+
