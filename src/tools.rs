@@ -2,14 +2,13 @@
 // src/tools.rs
 // ============================================================================
 use rust_mcp_sdk::schema::{schema_utils::CallToolError, CallToolResult, TextContent};
-
+use rust_mcp_sdk::macros::{mcp_tool, JsonSchema};
+use rust_mcp_sdk::tool_box;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::fs;
 use sha2::{Sha256, Digest};
 use crate::state::ServerState;
-
-use rust_mcp_sdk::macros::{mcp_tool, JsonSchema};
 
 //****************//
 //  LoadBinary    //
@@ -54,9 +53,9 @@ impl LoadBinary {
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
 pub struct ReadBytes {
     /// Starting offset in the buffer
-    pub offset: usize,
+    pub offset: u64,
     /// Number of bytes to read
-    pub length: usize,
+    pub length: u64,
 }
 
 impl ReadBytes {
@@ -65,17 +64,19 @@ impl ReadBytes {
     {
         let s = state.read().await;
         
-        if self.offset + self.length > s.buffer.len() {
+        if self.offset + self.length > s.buffer.len() as u64 {
             return Err(CallToolError::from_message("Read exceeds buffer bounds"));
         }
         
-        let bytes = &s.buffer[self.offset..self.offset + self.length];
+        let start = self.offset as usize;
+        let end = start + self.length as usize;
+        let bytes = &s.buffer[start..end];
         let hex_dump = hex::encode(bytes);
-        
+
         let ascii: String = bytes.iter()
             .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
             .collect();
-        
+
         let output = format!(
             "Offset 0x{:08X} ({} bytes):\nHex: {}\nASCII: {}",
             self.offset, self.length, hex_dump, ascii
@@ -140,9 +141,9 @@ impl SearchPattern {
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
 pub struct ExtractSegment {
     /// Starting offset
-    pub offset: usize,
+    pub offset: u64,
     /// Length of segment
-    pub length: usize,
+    pub length: u64,
     /// Optional label for the segment
     pub label: Option<String>,
 }
@@ -153,13 +154,15 @@ impl ExtractSegment {
     {
         let mut s = state.write().await;
         
-        if self.offset + self.length > s.buffer.len() {
+        if self.offset + self.length > s.buffer.len() as u64 {
             return Err(CallToolError::from_message("Segment exceeds buffer bounds"));
         }
         
-        let data = s.buffer[self.offset..self.offset + self.length].to_vec();
+        let start = self.offset as usize;
+        let end = start + self.length as usize;
+        let data = s.buffer[start..end].to_vec();
         let segment = crate::state::BinarySegment {
-            offset: self.offset,
+            offset: start as u64,
             data: data.clone(),
             label: self.label.clone(),
         };
@@ -190,7 +193,7 @@ pub struct AddBookmark {
     /// Name for the bookmark
     pub name: String,
     /// Offset to bookmark
-    pub offset: usize,
+    pub offset: u64,
 }
 
 impl AddBookmark {
@@ -199,15 +202,17 @@ impl AddBookmark {
     {
         let mut s = state.write().await;
         
-        if self.offset > s.buffer.len() {
+        let offset = self.offset as usize;
+        
+        if offset > s.buffer.len() {
             return Err(CallToolError::from_message("Offset exceeds buffer size"));
         }
         
-        s.bookmarks.insert(self.name.clone(), self.offset);
+        s.bookmarks.insert(self.name.clone(), offset);
         s.display();
         
         Ok(CallToolResult::text_content(vec![
-            TextContent::from(format!("✅ Bookmark '{}' added at 0x{:08X}", self.name, self.offset))
+            TextContent::from(format!("✅ Bookmark '{}' added at 0x{:08X}", self.name, offset))
         ]))
     }
 }
@@ -222,9 +227,9 @@ impl AddBookmark {
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
 pub struct ReadString {
     /// Starting offset
-    pub offset: usize,
+    pub offset: u64,
     /// Maximum length to read
-    pub max_length: usize,
+    pub max_length: u64,
 }
 
 impl ReadString {
@@ -233,8 +238,11 @@ impl ReadString {
     {
         let s = state.read().await;
         
-        let end = (self.offset + self.max_length).min(s.buffer.len());
-        let bytes = &s.buffer[self.offset..end];
+        let offset = self.offset as usize;
+        let max_length = self.max_length as usize;
+        
+        let end = (offset + max_length).min(s.buffer.len());
+        let bytes = &s.buffer[offset..end];
         
         let null_pos = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
         let str_bytes = &bytes[..null_pos];
@@ -243,7 +251,7 @@ impl ReadString {
         
         Ok(CallToolResult::text_content(vec![
             TextContent::from(format!("String at 0x{:08X} ({} bytes):\n{}", 
-                self.offset, str_bytes.len(), text))
+                offset, str_bytes.len(), text))
         ]))
     }
 }
@@ -258,7 +266,7 @@ impl ReadString {
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
 pub struct ReadInteger {
     /// Starting offset
-    pub offset: usize,
+    pub offset: u64,
     /// Integer size: 1, 2, 4, or 8 bytes
     pub size: u8,
     /// Endianness: 'little' or 'big'
@@ -271,11 +279,13 @@ impl ReadInteger {
     {
         let s = state.read().await;
         
-        if self.offset + self.size as usize > s.buffer.len() {
+        let offset = self.offset as usize;
+        
+        if offset + self.size as usize > s.buffer.len() {
             return Err(CallToolError::from_message("Read exceeds buffer bounds"));
         }
         
-        let bytes = &s.buffer[self.offset..self.offset + self.size as usize];
+        let bytes = &s.buffer[offset..offset + self.size as usize];
         
         let value = match (self.size, self.endian.as_str()) {
             (1, _) => bytes[0] as u64,
@@ -291,7 +301,7 @@ impl ReadInteger {
         Ok(CallToolResult::text_content(vec![
             TextContent::from(format!(
                 "u{} at 0x{:08X} ({} endian): {} (0x{:X})",
-                self.size * 8, self.offset, self.endian, value, value
+                self.size * 8, offset, self.endian, value, value
             ))
         ]))
     }
@@ -307,9 +317,9 @@ impl ReadInteger {
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
 pub struct CalculateHash {
     /// Optional offset (if None, hash entire buffer)
-    pub offset: Option<usize>,
+    pub offset: Option<u64>,
     /// Optional length (if None, hash from offset to end)
-    pub length: Option<usize>,
+    pub length: Option<u64>,
 }
 
 impl CalculateHash {
@@ -318,9 +328,9 @@ impl CalculateHash {
     {
         let s = state.read().await;
         
-        let offset = self.offset.unwrap_or(0);
+        let offset = self.offset.unwrap_or(0) as usize;
         let end = self.length
-            .map(|len| offset + len)
+            .map(|len| offset + len as usize)
             .unwrap_or(s.buffer.len());
         
         if end > s.buffer.len() {

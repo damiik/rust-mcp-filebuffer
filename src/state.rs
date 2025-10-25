@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
 pub struct BinarySegment {
-    pub offset: usize,
+    pub offset: u64,
     pub data: Vec<u8>,
     pub label: Option<String>,
 }

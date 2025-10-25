@@ -11,6 +11,7 @@ use rust_mcp_sdk::schema::{
     Implementation, InitializeResult, ServerCapabilities,
     ServerCapabilitiesTools, LATEST_PROTOCOL_VERSION,
 };
+use rust_mcp_sdk::McpServer;
 use handler::BinaryAnalysisHandler;
 
 #[derive(Parser)]
