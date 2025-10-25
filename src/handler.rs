@@ -17,12 +17,13 @@ pub struct BinaryAnalysisHandler {
 }
 
 impl BinaryAnalysisHandler {
-    pub fn new() -> Self {
+    pub async fn new() -> Self {
         let state = Arc::new(RwLock::new(ServerState::new()));
         
         println!("\n🔬 Binary Analysis MCP Server Starting...");
         {
-            let s = state.blocking_read();
+            // let s = state.blocking_read();
+            let s = state.read().await;
             s.display();
         } // Drop the read lock here before moving state
         
